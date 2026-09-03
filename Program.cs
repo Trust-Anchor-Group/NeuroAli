@@ -185,6 +185,8 @@ internal class Program
 					InternalJsonRpcCall JsonRpcCall = new(StdioJsonRpcLayer,
 						StdioUser, BaseUrl, SendEvent, "STDIO");
 
+					JsonRpcCall.SetSessionId("Internal");
+
 					string Output = await Mcp.ExecuteJsonRpc(JsonRpcCall, Input, StdioJsonRpcLayer);
 
 					if (!string.IsNullOrEmpty(Output))
