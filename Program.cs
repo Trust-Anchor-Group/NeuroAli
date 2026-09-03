@@ -1,4 +1,5 @@
-﻿using System.Text;
+﻿using NeuroAli;
+using System.Text;
 using Waher.Events;
 using Waher.Events.Files;
 using Waher.Events.Persistence;
@@ -8,12 +9,16 @@ using Waher.Mcp.Files;
 using Waher.Mcp.Identity;
 using Waher.Mcp.Payments;
 using Waher.Mcp.Xmpp;
+using Waher.Networking;
 using Waher.Networking.HTTP;
+using Waher.Networking.HTTP.JsonRpc;
+using Waher.Networking.HTTP.JsonRpc.Transports;
 using Waher.Networking.HTTP.Mcp;
 using Waher.Networking.HTTP.Mcp.Model;
 using Waher.Networking.Sniffers;
 using Waher.Persistence;
 using Waher.Persistence.Files;
+using Waher.Runtime.Console;
 using Waher.Runtime.Inventory;
 using Waher.Runtime.Inventory.Loader;
 
@@ -43,7 +48,7 @@ internal class Program
 						{
 							WorkingFolder = Arguments[i++];
 							if (!Directory.Exists(WorkingFolder))
-								throw new Exception("Working folder does not exist: " + WorkingFolder);
+								Directory.CreateDirectory(WorkingFolder);
 						}
 						else
 							throw new Exception("Missing data folder.");
@@ -137,9 +142,31 @@ internal class Program
 
 			StdioMcpServer Mcp = new (
 				WebServer.GetRegisteredResources<HttpMcpServerResource>(),
-				"/MCP", "StdioMcpServer", "Joined MCP Server", Array.Empty<Icon>(), 
-				null, McpSniffers);
+				"/MCP", "StdioMcpServer", "Joined MCP Server", [], null, McpSniffers);
+
 			WebServer.Register(Mcp);
+
+			// STDIO JSON-RPC environment
+
+			string JsonRpcFolder = Path.Combine(WorkingFolder, "JSON-RPC");
+			if (!Directory.Exists(JsonRpcFolder))
+				Directory.CreateDirectory(JsonRpcFolder);
+
+			XmlFileSniffer JsonRpcSniffer = new(
+				Path.Combine(JsonRpcFolder, "JSON-RPC %YEAR%-%MONTH%-%DAY%T%HOUR%.xml"),
+				Path.Combine(ExecutableFolder, "Transforms", "SnifferXmlToHtml.xslt"),
+				7, BinaryPresentationMethod.Hexadecimal);
+
+			StdioUser StdioUser = new();
+			string BaseUrl = "http://localhost:" + HttpPort.ToString() + "/MCP";
+			CommunicationLayer StdioJsonRpcLayer = new(true, JsonRpcSniffer);
+
+			static Task SendEvent(object _, NotificationEventArgs e)
+			{
+				string Event = JsonRpcWebService.FormatEventNotification(e);
+				ConsoleOut.WriteLine(Event);
+				return Task.CompletedTask;
+			}
 
 			// Starting modules
 
@@ -149,21 +176,29 @@ internal class Program
 
 			while (true)
 			{
-				string? Input = Console.In.ReadLine();
+				string? Input = await ConsoleIn.ReadLineAsync();
 				if (string.IsNullOrEmpty(Input))
 					break;
 
 				try
 				{
+					InternalJsonRpcCall JsonRpcCall = new(StdioJsonRpcLayer,
+						StdioUser, BaseUrl, SendEvent, "STDIO");
+
+					string Output = await Mcp.ExecuteJsonRpc(JsonRpcCall, Input, StdioJsonRpcLayer);
+
+					if (!string.IsNullOrEmpty(Output))
+						ConsoleOut.WriteLine(Output);
 				}
 				catch (Exception ex)
 				{
+					ConsoleError.WriteLine(ex.Message);
 				}
 			}
 		}
 		catch (Exception ex)
 		{
-			Console.Error.WriteLine(ex.Message);
+			ConsoleError.WriteLine(ex.Message);
 		}
 		finally
 		{
