@@ -38,15 +38,15 @@ interface, but over streaming HTTP. The local HTTP server also provides individu
 for individual MCP servers, if you want to connect and test them individually, or as groups.
 The following table lists the available endpoints:
 
-| Resource        | Description                                                                                                          |
-|:----------------|:---------------------------------------------------------------------------------------------------------------------|
-| `/MCP`          | Main MCP endpoint, provides the same functionality as STDIO interface, and contains all available MCP functionality. |
-| `/MCP/Content`  | Provides access to Internet Content.                                                                                 |
-| `/MCP/EventLog` | Allows the MCP client to log events, and search event logs.                                                          |
-| `/MCP/Files`    | Provides a means for MCP clients to store and access files in local File Storage.                                    |
-| `/MCP/XMPP`     | Permits an MCP client to connect to, and interact on, the XMPP network.                                              |
-| `/MCP/Identity` | Enables MCP clients to apply for and use digital Legal Identities.                                                   |
-| `/MCP/Payments` | Gives MCP clients capabilities to make payments.                                                                     |
+| Resource        | Description                                                                                                                    |
+|:----------------|:-------------------------------------------------------------------------------------------------------------------------------|
+| `/MCP`          | Main MCP endpoint, provides the same functionality as STDIO interface, and contains all available MCP functionality.           |
+| `/MCP/Content`  | Provides access to Internet Content.                                                                                           |
+| `/MCP/EventLog` | Allows the MCP client to log events, and search event logs.                                                                    |
+| `/MCP/Files`    | Provides a means for MCP clients to store and access files in local File Storage.                                              |
+| `/MCP/XMPP`     | Permits an MCP client to connect to, and interact on, the XMPP network.                                                        |
+| `/MCP/Identity` | Enables MCP clients to apply for and use digital Legal Identities and create, sign and propose smart contracts from templates. |
+| `/MCP/Payments` | Gives MCP clients capabilities to make payments.                                                                               |
 
 Docker
 ---------
