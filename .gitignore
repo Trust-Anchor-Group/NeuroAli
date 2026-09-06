@@ -5,7 +5,7 @@
 
 # NeuroAli local runtime data, diagnostics, and disposable validation output.
 # These paths can contain session data, credentials, trace traffic, or PII.
-.neuroali-data/
+.neuroali-data*/
 .neuroali-pagination-harness/
 .build-validation/
 *.jsonl

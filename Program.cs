@@ -12,14 +12,18 @@ using Waher.Mcp.Content;
 using Waher.Mcp.Events;
 using Waher.Mcp.Files;
 using Waher.Mcp.Identity;
+using Waher.Mcp.Identity.Responses;
 using Waher.Mcp.Payments;
 using Waher.Mcp.Xmpp;
+using Waher.Mcp.Xmpp.Responses;
 using Waher.Networking;
 using Waher.Networking.HTTP;
 using Waher.Networking.HTTP.JsonRpc;
 using Waher.Networking.HTTP.JsonRpc.Transports;
 using Waher.Networking.HTTP.Mcp;
 using Waher.Networking.HTTP.Mcp.Model;
+using Waher.Networking.HTTP.Mcp.Model.Attributes;
+using Waher.Networking.HTTP.Mcp.Model.Server;
 using Waher.Networking.Sniffers;
 using Waher.Persistence;
 using Waher.Persistence.Files;
@@ -27,6 +31,8 @@ using Waher.Runtime.Console;
 using Waher.Runtime.Inventory;
 using Waher.Runtime.Inventory.Loader;
 using Waher.Security.JWT;
+using Waher.Networking.XMPP.Contracts;
+using Waher.Networking.XMPP.Contracts.EventArguments;
 
 internal class Program
 {
@@ -129,6 +135,269 @@ internal class Program
 		}
 	}
 
+	private sealed class CompatibleIdentityMcpServer : IdentityMcpServer
+	{
+		private sealed class ContractProposalDecision
+		{
+			[McpParameter("Accept", "If you accept the proposal and want to sign the contract.")]
+			public bool? Accept = null;
+		}
+
+		private static readonly System.Reflection.FieldInfo? ContractProposalReceivedField =
+			typeof(ContractsClient).GetField("ContractProposalReceived",
+				System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+		private readonly HashSet<ContractsClient> ProposalClients = new();
+
+		public CompatibleIdentityMcpServer(string ResourceName, XmppMcpServer XmppMcpServer, ISnifferSet SnifferSet)
+			: base(ResourceName, XmppMcpServer, SnifferSet)
+		{
+		}
+
+		private static void ProposalTrace(string Marker, string? Result = null)
+		{
+			ConsoleError.WriteLine(Result is null ? Marker : Marker + " result=" + Result);
+		}
+
+		private void EnsureCompatibleProposalHandler(ContractsClient Client)
+		{
+			lock (this.ProposalClients)
+			{
+				if (!this.ProposalClients.Add(Client))
+					return;
+			}
+
+			if (ContractProposalReceivedField?.GetValue(Client) is Delegate Handlers)
+			{
+				foreach (Delegate Handler in Handlers.GetInvocationList())
+				{
+					if (ReferenceEquals(Handler.Target, this) &&
+						Handler.Method.Name == "ContractsClient_ContractProposalReceived")
+					{
+						Client.ContractProposalReceived -=
+							(EventHandlerAsync<ContractProposalEventArgs>)Handler;
+					}
+				}
+			}
+
+			Client.ContractProposalReceived += this.ContractsClient_CompatibleContractProposalReceived;
+			ProposalTrace("PROPOSAL_TRACE_HANDLER_INSTALLED");
+		}
+
+		private async Task<Contract?> TryReadProposedContract(Waher.Security.IUser User,
+			ContractsClient Client, string ContractId)
+		{
+			ProposalTrace("PROPOSAL_TRACE_CONTRACT_READ_START");
+
+			try
+			{
+				Contract? Contract = await PetitionCache.TryGetContract(User.UserName,
+					ContractId, Client)
+					?? await Client.GetContractAsync(ContractId);
+
+				ProposalTrace("PROPOSAL_TRACE_CONTRACT_READ_RESULT", "SUCCESS");
+				return Contract;
+			}
+			catch (Exception ex)
+			{
+				string Result = ex.Message.Contains("not authorized", StringComparison.OrdinalIgnoreCase)
+					? "NOT_AUTHORIZED"
+					: "FAILED";
+				ProposalTrace("PROPOSAL_TRACE_CONTRACT_READ_RESULT", Result);
+				return null;
+			}
+		}
+
+		private async Task<string> HandleContractProposal(IJsonRpcCall Call,
+			Waher.Security.IUser User, Session Session, ContractsClient Client,
+			string ContractId, string Role, string FromBareJid, string Message,
+			bool SignAfterApproval)
+		{
+			Contract? Contract = await this.TryReadProposedContract(User, Client, ContractId);
+			if (Contract is null)
+				return "Contract access is not authorized; no approval was requested.";
+
+			await PetitionCache.AddContract(User.UserName, Contract);
+			this.ResourcesUpdated(User);
+
+			StringBuilder Text = new();
+			Text.Append("You have received a contract proposal from ");
+			Text.Append(FromBareJid);
+			Text.Append(": ");
+			Text.AppendLine(Message);
+			Text.Append("Contract: ");
+			Text.AppendLine(ContractId);
+			Text.AppendLine();
+			Text.AppendLine("Contents of the contract proposal follows:");
+			Text.AppendLine();
+			Text.Append(await Contract.ToPlainText(Contract.DefaultLanguage));
+
+			ProposalTrace("PROPOSAL_TRACE_ELICITATION_SEND");
+			bool? Result = await this.ElicitUserInput(Call, Text.ToString(), new ContractProposalDecision(),
+				true, Session, 15 * 60 * 1000);
+			ProposalTrace("PROPOSAL_TRACE_ELICITATION_RESULT",
+				Result.HasValue ? (Result.Value ? "ACCEPTED" : "DECLINED") : "NO_RESPONSE");
+
+			if (!Result.HasValue)
+				return "No approval response was received; the contract was not signed.";
+			if (!Result.Value)
+				return "The proposal was declined; the contract was not signed.";
+			if (!SignAfterApproval)
+				return "The proposal was approved for signing by the MCP caller.";
+
+			Contract = await Client.SignContractAsync(Contract, Role, false);
+			await PetitionCache.AddContract(User.UserName, Contract);
+			this.ResourcesUpdated(User);
+			return "The proposal was accepted and the smart contract was signed.";
+		}
+
+		private async Task ContractsClient_CompatibleContractProposalReceived(object Sender,
+			ContractProposalEventArgs e)
+		{
+			ProposalTrace("PROPOSAL_TRACE_RECEIVED");
+
+			if (Sender is not ContractsClient Client ||
+				!Client.Client.TryGetTag("User", out Waher.Security.IUser? User) || User is null ||
+				!Client.Client.TryGetExtension(out McpXmppExtension McpXmppExtension))
+			{
+				ProposalTrace("PROPOSAL_TRACE_MCP_SESSION_FOUND", "NO");
+				return;
+			}
+
+			foreach (string SessionId in McpXmppExtension.SessionIds)
+			{
+				if (this.TryGetMcpSession(SessionId, out Session? Session) && Session.User is not null)
+				{
+					ProposalTrace("PROPOSAL_TRACE_MCP_SESSION_FOUND", "YES");
+					await this.HandleContractProposal(McpXmppExtension.FirstCall, User, Session,
+						Client, e.ContractId, e.Role, e.FromBareJID, e.MessageText, true);
+					return;
+				}
+			}
+
+			ProposalTrace("PROPOSAL_TRACE_MCP_SESSION_FOUND", "NO");
+		}
+
+		[McpServerTool(
+			"Recover Contract Proposal",
+			"Locally resumes a previously received contract proposal without sending it again.",
+			"",
+			true,
+			false,
+			false,
+			true)]
+		public async Task<GenericResponse> RecoverContractProposal(
+			IJsonRpcCall Call,
+			[McpStringParameter("ContractId", "Identifier of the previously proposed smart contract.")]
+			string ContractId,
+			[McpStringParameter("Role", "Role proposed to the recipient.")]
+			string Role,
+			[McpStringParameter("From", "Bare JID recorded on the received proposal.")]
+			string From,
+			[McpStringParameter("Message", "Message recorded on the received proposal.")]
+			string Message)
+		{
+			Session? Session = await this.TryGetMcpSession(Call);
+			if (Session is null)
+				return new GenericResponse(false, "No MCP session.");
+
+			Waher.Security.IUser? User = await this.GetAuthenticatedUser(Call, Session);
+			if (Call.ResponseSent || User is null)
+				return new GenericResponse(false, "User not authenticated.");
+
+			ContractsClient? Client = await this.GetClient(Call, User, Session, true);
+			if (Client is null)
+				return new GenericResponse(false, "MCP XMPP Contracts client not available.");
+
+			this.EnsureCompatibleProposalHandler(Client);
+			ProposalTrace("PROPOSAL_TRACE_RECOVERY_START");
+			string Result = await this.HandleContractProposal(Call, User, Session, Client,
+				ContractId, Role, From, Message, false);
+			return new GenericResponse(!Result.StartsWith("Contract access", StringComparison.Ordinal), Result);
+		}
+
+		[McpServerTool(
+			"Authorize Contract Access",
+			"Authorizes a specific legal identity to read a smart contract.",
+			"",
+			true,
+			false,
+			true,
+			true)]
+		public async Task<GenericResponse> AuthorizeContractAccess(
+			IJsonRpcCall Call,
+			[McpStringParameter("ContractId", "Identifier of the smart contract.")]
+			string ContractId,
+			[McpStringParameter("RemoteLegalId", "Legal identity receiving contract access.")]
+			string RemoteLegalId)
+		{
+			Session? Session = await this.TryGetMcpSession(Call);
+			if (Session is null)
+				return new GenericResponse(false, "No MCP session.");
+
+			Waher.Security.IUser? User = await this.GetAuthenticatedUser(Call, Session);
+			if (Call.ResponseSent || User is null)
+				return new GenericResponse(false, "User not authenticated.");
+
+			ContractsClient? Client = await this.GetClient(Call, User, Session, true);
+			if (Client is null)
+				return new GenericResponse(false, "MCP XMPP Contracts client not available.");
+
+			try
+			{
+				await Client.AuthorizeAccessToContractAsync(ContractId, RemoteLegalId, true);
+				ProposalTrace("PROPOSAL_TRACE_ACCESS_GRANT_RESULT", "SUCCESS");
+				return new GenericResponse(true, "Contract access authorized.");
+			}
+			catch (Exception)
+			{
+				ProposalTrace("PROPOSAL_TRACE_ACCESS_GRANT_RESULT", "FAILED");
+				return new GenericResponse(false, "Contract access authorization failed.");
+			}
+		}
+
+		public override async Task<Waher.Networking.HTTP.Mcp.Model.Server.Resource[]> GetResources(
+			IJsonRpcCall Call, Waher.Security.IUser? User,
+			Waher.Networking.HTTP.Mcp.Model.Server.Session? Session)
+		{
+			var Resources = (await base.GetResources(Call, User, Session)).ToList();
+			if (User is null || Session is null)
+				return Resources.ToArray();
+
+			ContractsClient? Client = await this.GetClient(Call, User, Session, false);
+			if (Client is null)
+				return Resources.ToArray();
+
+			this.EnsureCompatibleProposalHandler(Client);
+
+			HashSet<string> Uris = new(Resources.Select(Resource => Resource.Uri.OriginalString));
+			foreach (Contract Contract in (await Client.GetCreatedContractsAsync()).Contracts)
+			{
+				if (Uris.Add(Contract.ContractIdUriString))
+					Resources.Add(new ContractResource(Contract));
+			}
+
+			return Resources.ToArray();
+		}
+
+		public override async Task<Waher.Networking.HTTP.Mcp.Model.Server.Resource?> TryGetResource(
+			IJsonRpcCall Call, Waher.Security.IUser? User, Uri Uri,
+			Waher.Networking.HTTP.Mcp.Model.Server.Session? Session)
+		{
+			if (Uri.Scheme != "iotsc" || User is null || Session is null)
+				return await base.TryGetResource(Call, User, Uri, Session);
+
+			ContractsClient? Client = await this.GetClient(Call, User, Session, true);
+			if (Client is null)
+				return null;
+
+			this.EnsureCompatibleProposalHandler(Client);
+
+			Contract Contract = await Client.GetContractAsync(Uri.AbsolutePath);
+			await PetitionCache.AddContract(User.UserName, Contract);
+			return new ContractResource(Contract);
+		}
+	}
+
 	private static bool IsInitialToolsListRequest(string Input)
 	{
 		try
@@ -151,6 +420,72 @@ internal class Program
 		{
 			return false;
 		}
+	}
+
+	private static async Task<string?> TryExecuteCompatibleCreateOpenContract(InternalJsonRpcCall Call,
+		IdentityMcpServer Server, string Input)
+	{
+		const string TemplateId = "323064dd-0e43-4f7b-6833-3d05e10bb267@legal.lab.tagroot.io";
+		JsonObject? Root;
+		JsonObject? Arguments;
+
+		try
+		{
+			Root = JsonNode.Parse(Input)?.AsObject();
+			if (Root?["method"]?.GetValue<string>() != "tools/call" ||
+				Root["params"]?["name"]?.GetValue<string>() != "CreateOpenContract" ||
+				(Root["params"]?["arguments"] as JsonObject)?["TemplateId"]?.GetValue<string>() != TemplateId)
+			{
+				return null;
+			}
+
+			Arguments = Root["params"]!["arguments"]!.AsObject();
+		}
+		catch
+		{
+			return null;
+		}
+
+		JsonObject ParameterNodes = Arguments["Parameters"]!.AsObject();
+		Dictionary<string, object> Parameters = new(StringComparer.Ordinal);
+		foreach ((string Name, JsonNode? Node) in ParameterNodes)
+		{
+			if (Name == "Deadline" && Node is JsonValue DateValue &&
+				DateValue.TryGetValue(out string? DateText) &&
+				DateTime.TryParse(DateText, null, System.Globalization.DateTimeStyles.RoundtripKind, out DateTime Deadline))
+			{
+				Parameters[Name] = Deadline;
+			}
+			else if (Node is JsonValue Value && Value.TryGetValue(out string? StringValue))
+				Parameters[Name] = StringValue;
+			else if (Node is JsonValue NumberValue && NumberValue.TryGetValue(out decimal DecimalValue))
+				Parameters[Name] = DecimalValue;
+			else
+				throw new JsonException("Unsupported contract parameter value.");
+		}
+
+		ContractResponse Response = await Server.CreateOpenContract(Call, TemplateId, Parameters,
+			Enum.Parse<ContractVisibility>(Arguments["Visibility"]!.GetValue<string>()),
+			Arguments["DurationDays"]!.GetValue<int>(),
+			Arguments["ArchiveRequiredDays"]?.GetValue<int>() ?? 365,
+			Arguments["ArchiveOptionalDays"]?.GetValue<int>() ?? 0);
+		JsonObject Properties = new()
+		{
+			["Contract"] = JsonSerializer.SerializeToNode(Response.Contract),
+			["Success"] = Response.Success,
+			["Message"] = Response.Message
+		};
+		JsonObject ResultValue = new() { ["type"] = "object", ["properties"] = Properties };
+		return new JsonObject
+		{
+			["jsonrpc"] = "2.0",
+			["id"] = Root["id"]?.DeepClone(),
+			["result"] = new JsonObject
+			{
+				["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = ResultValue.ToJsonString() }),
+				["structuredContent"] = new JsonObject { ["result"] = ResultValue.DeepClone() }
+			}
+		}.ToJsonString();
 	}
 
 	private static Task IgnoreInternalEvent(object _, NotificationEventArgs e)
@@ -385,7 +720,7 @@ internal class Program
 			EventLogMcpServer EventLogMcpServer = new("/MCP/EventLog", McpSniffers);
 			FileStorageMcpServer FileStorageMcpServer = new("/MCP/Files", McpFilesFolder, McpSniffers);
 			XmppMcpServer XmppMcpServer = new("/MCP/XMPP", McpSniffers);
-			IdentityMcpServer IdentityMcpServer = new("/MCP/Identity", XmppMcpServer, McpSniffers);
+			IdentityMcpServer IdentityMcpServer = new CompatibleIdentityMcpServer("/MCP/Identity", XmppMcpServer, McpSniffers);
 			PaymentsMcpServer PaymentsMcpServer = new("/MCP/Payments", XmppMcpServer, IdentityMcpServer, McpSniffers);
 
 			WebServer.Register(ContentMcpServer);
@@ -463,9 +798,11 @@ internal class Program
 					if (await Target.TryGetMcpSession(JsonRpcCall) is { } ExistingSession)
 						Target.RegisterSession(JsonRpcCall, ExistingSession);
 
-					string Output = Target == Mcp ?
+					string? CompatibleOutput = Target == IdentityMcpServer ?
+						await TryExecuteCompatibleCreateOpenContract(JsonRpcCall, IdentityMcpServer, Input) : null;
+					string Output = CompatibleOutput ?? (Target == Mcp ?
 						await ExecuteCompleteJoinedToolsList(JsonRpcCall, Mcp, Input, StdioJsonRpcLayer, BaseUrl) :
-						await Target.ExecuteJsonRpc(JsonRpcCall, Input, StdioJsonRpcLayer);
+						await Target.ExecuteJsonRpc(JsonRpcCall, Input, StdioJsonRpcLayer));
 
 					if (JsonRpcCall.TryGetSessionId(out string? NewSessionId))
 						SessionId = NewSessionId;
