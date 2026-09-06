@@ -1,4 +1,6 @@
 ﻿using NeuroAli;
+using Waher.Mcp.Identity.Resources;
+using Waher.Networking.HTTP.JsonRpc.MetaData;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -39,6 +41,43 @@ internal class Program
 			: base(Servers, ResourceName, Name, Description, Icons, WebsiteUrl, Sniffers)
 		{
 			this.McpServers = Servers;
+		}
+
+		public override async Task<Waher.Networking.HTTP.Mcp.Model.Server.Resource?> TryGetResource(
+			IJsonRpcCall Call, Waher.Security.IUser? User, Uri Uri,
+			Waher.Networking.HTTP.Mcp.Model.Server.Session? Session)
+		{
+			foreach (HttpMcpServerResource Server in this.McpServers)
+			{
+				var Resource = await Server.TryGetResource(Call, User, Uri, Session);
+				if (Resource is not null) return Resource;
+				foreach (var Listed in await Server.GetResources(Call, User, Session))
+					if (Listed.Uri == Uri) return Listed;
+			}
+			return null;
+		}
+
+		[JsonRpcMethod]
+		[JsonRpcDocName("resources/read")]
+		protected override async Task<Dictionary<string, object>?> Resources_Read(IJsonRpcCall Call, Uri Uri,
+			[JsonRpcMetaDataArgument] object? _Meta = null)
+		{
+			// Preserve default resource output; JSON is explicitly negotiated by clients.
+			var Result = await base.Resources_Read(Call, Uri, _Meta);
+			if (Result is null || !Result.ContainsKey("contents") ||
+				_Meta is not Dictionary<string, object> Meta ||
+				!Meta.TryGetValue("reliefmesh/format", out var Format) || !Equals(Format, "json")) return Result;
+			var Session = await this.TryGetMcpSession(Call);
+			var Resource = await this.TryGetResource(Call, Session?.User, Uri, Session);
+			object? Value = Resource switch {
+				IdentityResource Identity => Identity.Identity.ToJson(),
+				ContractResource Contract => Contract.Contract.ToJson(),
+				_ => null
+			};
+			if (Value is not null) Result["contents"] = new[] { new Dictionary<string, object> {
+				["uri"] = Uri.OriginalString, ["mimeType"] = "application/json", ["text"] = Waher.Content.JSON.Encode(Value, false)
+			} };
+			return Result;
 		}
 
 		public override async Task GET(HttpRequest Request, HttpResponse Response)
@@ -432,7 +471,11 @@ internal class Program
 						SessionId = NewSessionId;
 
 					if (await Target.TryGetMcpSession(JsonRpcCall) is { } CurrentSession)
-						Target.RegisterSession(JsonRpcCall, CurrentSession);
+					{
+						Mcp.RegisterSession(JsonRpcCall, CurrentSession);
+						foreach (HttpMcpServerResource Owner in McpServers)
+							Owner.RegisterSession(JsonRpcCall, CurrentSession);
+					}
 
 					if (!string.IsNullOrEmpty(Output))
 						ConsoleOut.WriteLine(Output);
