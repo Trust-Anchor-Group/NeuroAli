@@ -1,0 +1,103 @@
+name: Linux x64 package
+
+on:
+  push:
+    branches:
+      - deploy/linux-x64-2026-09-08
+      - certify/linux-x64-*
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify frozen baseline and deployment-only changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse 'neuroali-blockathon-ready-2026-09-07^{}')" = \
+            "e61f121229c905401bd0fb8d2474726f22610905"
+          git merge-base --is-ancestor \
+            e61f121229c905401bd0fb8d2474726f22610905 HEAD
+          test -z "$(git diff --name-only \
+            e61f121229c905401bd0fb8d2474726f22610905...HEAD -- \
+            ':!NeuroAli.csproj' \
+            ':!packages.lock.json' \
+            ':!scripts/linux-stdio-smoke.mjs' \
+            ':!.github/workflows/linux-x64-package.yml')"
+
+      - name: Install .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Locked restore
+        run: dotnet restore NeuroAli.csproj --runtime linux-x64 --locked-mode
+
+      - name: Publish Linux x64
+        run: >-
+          dotnet publish NeuroAli.csproj
+          -c Release
+          -r linux-x64
+          --self-contained false
+          --no-restore
+          -o "${{ runner.temp }}/neuroali-linux-x64"
+
+      - name: Validate native runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish="${{ runner.temp }}/neuroali-linux-x64"
+          test -f "$publish/NeuroAli.dll"
+          test -f "$publish/libSkiaSharp.so"
+          file "$publish/libSkiaSharp.so" | tee "${{ runner.temp }}/libSkiaSharp.file.txt"
+          file "$publish/libSkiaSharp.so" | grep -q 'ELF 64-bit.*x86-64'
+          ldd "$publish/libSkiaSharp.so" | tee "${{ runner.temp }}/libSkiaSharp.ldd.txt"
+          ! ldd "$publish/libSkiaSharp.so" | grep -q 'not found'
+          python3 -c 'import ctypes,sys; ctypes.CDLL(sys.argv[1])' "$publish/libSkiaSharp.so"
+
+      - name: Certify joined STDIO discovery
+        run: node scripts/linux-stdio-smoke.mjs "${{ runner.temp }}/neuroali-linux-x64/NeuroAli.dll"
+
+      - name: Create reproducible artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          publish="${{ runner.temp }}/neuroali-linux-x64"
+          output="$RUNNER_TEMP/package"
+          mkdir -p "$output"
+          tar --sort=name \
+            --mtime='UTC 1970-01-01' \
+            --owner=0 --group=0 --numeric-owner \
+            -C "$publish" \
+            -czf "$output/neuroali-linux-x64.tar.gz" .
+          if tar -tzf "$output/neuroali-linux-x64.tar.gz" | \
+            grep -Eiq '(^|/)(\.neuroali-data[^/]*|credentials?|passwords?|[^/]*\.(pem|key|jwt|jsonl))(/|$)'; then
+            echo 'Sensitive runtime path found in archive' >&2
+            exit 1
+          fi
+          cd "$output"
+          sha256sum neuroali-linux-x64.tar.gz > neuroali-linux-x64.tar.gz.sha256
+          cat neuroali-linux-x64.tar.gz.sha256
+
+      - name: Upload certified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: neuroali-linux-x64-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/package/neuroali-linux-x64.tar.gz
+            ${{ runner.temp }}/package/neuroali-linux-x64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
