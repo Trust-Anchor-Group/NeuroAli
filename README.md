@@ -14,7 +14,20 @@ The executable supports the following command-line options:
 |:------------|:-----------------------------------------------------------------|
 | `-d FOLDER` | Sets the working folder where data is stored to `FOLDER`.        |
 | `-p PORT`   | Defines the HTTP port number to use as `PORT`. (Default is 8080) |
+| `-y`        | Uses the working folder even if it contains unrelated files.     |
+| `-r ALIAS URL` | Proxies the remote MCP endpoint at `URL` (see [Remote MCP servers](#remote-mcp-servers)). Can be repeated. |
+| `-ri ALIAS JID` | Requests JWT tokens for remote `ALIAS` from `JID`, instead of the host name of its URL. |
 | `-h`        | Shows command-line parameters available.                         |
+
+If `-d` is not given, the working folder is the current directory (where the program is
+run from), not the folder the program is installed in.
+
+On startup, Neuro-Ali checks that the working folder is empty or only contains folders it
+created itself (`Data`, `Events`, `HTTP`, `JSON-RPC`, `MCP`). If it contains anything else,
+Neuro-Ali shows the full path and the unrelated items on standard error. When run from a
+terminal, it asks for confirmation before continuing. When input is redirected, for example
+when an MCP client starts it, it cannot ask, so it exits without starting. Use `-d` to point
+to a dedicated folder, or `-y` to skip the check.
 
 STDIO interface
 ------------------
@@ -27,6 +40,63 @@ either JSON-RPC responses, or SSE events (containing JSON-RPC encoded events and
 comments).
 
 You quit the application by entering an empty line.
+
+Remote MCP servers
+---------------------
+
+Neuro-Ali can proxy MCP endpoints hosted on other Neurons, so their tools appear next to
+the local ones in the STDIO interface:
+
+```
+NeuroAli -d C:\NeuroAli -r b https://neuron-b.example/MCP/EventLog
+```
+
+Authentication uses the XMPP account Neuro-Ali is logged in with (the account linked
+through the local XMPP tools). For each remote, Neuro-Ali requests a short-lived JWT
+over XMPP (`urn:xmpp:jwt:0`) from the remote Neuron's domain, and sends it as
+`Authorization: Bearer` over HTTPS. For this to work, the remote Neuron must have a user
+named exactly by Neuro-Ali's bare JID, with the privileges the remote tools require.
+Tokens are cached and renewed 30 seconds before they expire.
+
+To proxy a Neuron running on the same machine, use its loopback endpoint, for example
+`-r local-eventlog http://localhost/MCP/EventLog`. With no explicit issuer, Neuro-Ali
+requests the JWT from the connected local XMPP broker. Set up an account on that broker
+and grant it the privileges for the tools you want to use.
+
+* Remote tools and prompts are listed as `ALIAS_NAME`, with `[ALIAS]` added to their
+  descriptions. Remote resources keep their URIs.
+* If no XMPP account is linked yet, remote items are left out of the lists. Calling a
+  remote tool asks for the XMPP login first. After the next tool call, Neuro-Ali tells
+  the client that its lists have changed.
+* Neuro-Ali keeps a server-sent event stream open to each remote, so remote servers
+  can ask for input. Neuro-Ali only offers URL-mode input to remote servers, so
+  credentials are always entered in the remote Neuron's own form.
+* Remote URLs must use HTTPS (plain HTTP is only accepted for `localhost`), and
+  redirects are not followed, so the token is never sent to another host.
+* Calls to remote servers run in the background, so slow remote calls do not block
+  local ones.
+
+Administration pages
+-----------------------
+
+The local web server has administration pages under `/Admin`. They only answer requests
+from the local machine to `localhost` (or a loopback address):
+
+| Page                                   | Description                                                                                  |
+|:---------------------------------------|:---------------------------------------------------------------------------------------------|
+| `http://localhost:8080/Admin/Remotes.md` | Discover MCP servers from a Neuron base URL and enable or disable saved remote servers. |
+| `http://localhost:8080/Admin/Sniffers.md` | Lists sniffer files (MCP, JSON-RPC and HTTP), and shows them as HTML.                        |
+
+Discovery checks which servers offer tools, prompts, or resources to the linked XMPP account.
+Newly discovered servers start disabled. Enable or disable them on the page to update the
+proxy immediately. The setting is saved across restarts. Gateways that advertise exact MCP
+paths can discover custom endpoints at any path. For older gateways, discovery checks the
+standard paths and paths inferred from advertised MCP scopes. You can enter an exact URL
+manually for other endpoints. Manual additions still take effect after restart. If an alias
+is defined in both settings and the command line, the command line wins.
+
+The pages are Markdown files with server-side script, in the `Root/Admin` folder next to the
+executable, and can be edited there. Forms use a per-session anti-forgery token.
 
 HTTP interface
 -----------------

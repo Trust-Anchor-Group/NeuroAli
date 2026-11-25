@@ -619,6 +619,10 @@ internal class Program
 			string ExecutableFolder = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? WorkingFolder;
 			string s;
 			int HttpPort = 8080;
+			bool WorkingFolderFromArgument = false;
+			bool SkipWorkingFolderCheck = false;
+			List<(string Alias, string Url)> RemoteDefinitions = [];
+			Dictionary<string, string> RemoteIssuers = new(StringComparer.OrdinalIgnoreCase);
 			int i = 0;
 			int c = Arguments.Length;
 
@@ -632,6 +636,7 @@ internal class Program
 						if (i < c)
 						{
 							WorkingFolder = Arguments[i++];
+							WorkingFolderFromArgument = true;
 							if (!Directory.Exists(WorkingFolder))
 								Directory.CreateDirectory(WorkingFolder);
 						}
@@ -652,14 +657,70 @@ internal class Program
 							throw new Exception("Missing port number.");
 						break;
 
+					case "-y":
+						SkipWorkingFolderCheck = true;
+						break;
+
+					case "-r":
+						if (i + 1 < c)
+						{
+							string Alias = Arguments[i++];
+							RemoteDefinitions.Add((Alias, Arguments[i++]));
+						}
+						else
+							throw new Exception("Missing alias or URL for -r.");
+						break;
+
+					case "-ri":
+						if (i + 1 < c)
+						{
+							string Alias = Arguments[i++];
+							RemoteIssuers[Alias] = Arguments[i++];
+						}
+						else
+							throw new Exception("Missing alias or issuer for -ri.");
+						break;
+
 					case "-h":
 						Console.Out.WriteLine("Command-line parameters:");
 						Console.Out.WriteLine();
 						Console.Out.WriteLine("-d FOLDER     Sets the working folder where data is stored to FOLDER.");
 						Console.Out.WriteLine("-p PORT       Defines the HTTP port number to use as PORT.");
+						Console.Out.WriteLine("-y            Uses the working folder even if it contains unrelated files.");
+						Console.Out.WriteLine("-r ALIAS URL  Proxies the remote MCP endpoint at URL. Remote tools and prompts");
+						Console.Out.WriteLine("              are named ALIAS_NAME. Can be repeated.");
+						Console.Out.WriteLine("-ri ALIAS JID Requests JWT tokens for remote ALIAS from JID, instead of the");
+						Console.Out.WriteLine("              host name of its URL.");
+						Console.Out.WriteLine();
+						Console.Out.WriteLine("Remote servers can also be added on http://localhost:PORT/Admin/Remotes.md");
+						Console.Out.WriteLine("(local access only). Added servers are used after a restart.");
+						Console.Out.WriteLine();
 						Console.Out.WriteLine("-h            Shows command-line parameters available.");
 						return;
 				}
+			}
+
+			List<RemoteMcpEndpoint> RemoteEndpoints = [];
+
+			foreach ((string Alias, string Url) in RemoteDefinitions)
+			{
+				RemoteIssuers.TryGetValue(Alias, out string? Issuer);
+				RemoteEndpoints.Add(RemoteMcpEndpoint.Create(Alias, Url, Issuer));
+			}
+
+			foreach (string Alias in RemoteIssuers.Keys)
+			{
+				if (!RemoteDefinitions.Exists(P => string.Equals(P.Alias, Alias, StringComparison.OrdinalIgnoreCase)))
+					throw new Exception("-ri refers to unknown remote alias: " + Alias);
+			}
+
+			// Checking the working folder before anything is created in it
+
+			if (!SkipWorkingFolderCheck &&
+				!WorkingFolderCheck.Confirm(WorkingFolder, WorkingFolderFromArgument, ExecutableFolder))
+			{
+				Environment.ExitCode = 1;
+				return;
 			}
 
 			// Initializing type inventory
@@ -701,6 +762,31 @@ internal class Program
 				Path.Combine(HttpLogFolder, "HTTP %YEAR%-%MONTH%-%DAY%T%HOUR%.xml"),
 				Path.Combine(ExecutableFolder, "Transforms", "SnifferXmlToHtml.xslt"),
 				7, BinaryPresentationMethod.Hexadecimal));
+
+			// Administration pages (local access only). Markdown and web script must be
+			// protected, so their source (including script) is never returned as-is.
+
+			HttpFolderResource.ProtectContentType(Waher.Content.Markdown.MarkdownCodec.ContentType);
+			HttpFolderResource.ProtectContentType(Waher.Content.Markdown.Web.WebScript.WsCodec.ContentType);
+
+			AdminPages.Initialize(WorkingFolder, ExecutableFolder);
+			LocalOnlyAuthentication LocalOnly = new();
+
+			HttpFolderResource AdminFolder = new("/Admin", Path.Combine(ExecutableFolder, "Root", "Admin"),
+				false, false, false, true, LocalOnly);
+			AdminFolder.AllowTypeConversion();
+
+			// Remote MCP servers: command-line definitions, followed by those saved on the
+			// administration page.
+
+			List<string> RemoteWarnings = [];
+			RemoteEndpoints = await RemoteMcpConfiguration.LoadAsync(RemoteEndpoints, RemoteWarnings);
+
+			foreach (string Warning in RemoteWarnings)
+			{
+				Log.Warning(Warning);
+				ConsoleError.WriteLine(Warning);
+			}
 
 			// Initializing MCP servers
 
@@ -775,20 +861,104 @@ internal class Program
 
 			string? SessionId = null;
 
+			// Remote MCP proxy. Tokens are requested using the same XMPP account as the
+			// local XMPP tools (the account linked to the STDIO user).
+
+			async Task<Waher.Networking.XMPP.XmppClient?> GetProxyXmppClient(bool CreateIfNotDefined)
+			{
+				string? CurrentSessionId = SessionId;
+				InternalJsonRpcCall Call = new InternalJsonRpcCall(StdioJsonRpcLayer, StdioUser, BaseUrl, SendEvent, "STDIO");
+				if (string.IsNullOrEmpty(CurrentSessionId))
+				{
+					await XmppMcpServer.ExecuteJsonRpc(Call, """
+						{
+						  "jsonrpc": "2.0",
+						  "id": "discovery-init",
+						  "method": "initialize",
+						  "params": {
+						    "protocolVersion": "2025-11-25",
+						    "capabilities": {},
+						    "clientInfo": {"name": "Neuro-Ali discovery", "version": "1.0"}
+						  }
+						}
+						""", StdioJsonRpcLayer);
+				}
+				else
+					Call.SetSessionId(CurrentSessionId);
+
+				if (await XmppMcpServer.TryGetMcpSession(Call) is not { } Session)
+					return null;
+
+				return await XmppMcpServer.GetClient(XmppMcpServer, Call, StdioUser, Session,
+					CreateIfNotDefined);
+			}
+
+			XmppAccountSettings.Initialize(XmppMcpServer, StdioUser, BaseUrl, GetProxyXmppClient);
+
+			await using RemoteMcpProxy Proxy = new RemoteMcpProxy(RemoteEndpoints, GetProxyXmppClient, ConsoleOut.WriteLine);
+
+			RemoteMcpConfiguration.SetProxy(Proxy);
+
 			// Starting modules
 
 			await Types.StartAllModules(60000);
+
+			WebServer.Register(AdminFolder);
+			WebServer.Register(new SnifferViewerResource("/Admin/Sniffer", LocalOnly));
+			WebServer.Register("/Index.md", (Request, Response) =>
+				throw new FoundException("/Admin/Remotes.md"),
+				Synchronous: true, HandlesSubPaths: false, UserSessions: false, LocalOnly);
 
 			// Main loop
 
 			while (true)
 			{
-				string? Input = await ConsoleIn.ReadLineAsync();
+				string? Input = await Console.In.ReadLineAsync();
 				if (string.IsNullOrEmpty(Input))
 					break;
 
 				try
 				{
+					JsonObject? Message = null;
+
+					if (Proxy.HasRemotes)
+					{
+						try
+						{
+							Message = JsonNode.Parse(Input) as JsonObject;
+						}
+						catch (JsonException)
+						{
+							Message = null;
+						}
+
+						if (Message is not null)
+						{
+							if (Proxy.TryHandleClientResponse(Message))
+								continue;
+
+							if (Proxy.TryGetTarget(Message, out RemoteMcpServer? Remote, out JsonObject? RemoteParams))
+							{
+								// Remote calls run in the background, so the STDIO loop keeps
+								// reading client input (for instance responses to elicitations).
+
+								string Method = Message["method"]!.ToString();
+								JsonNode? ClientId = Message["id"]?.DeepClone();
+
+								_ = Task.Run(async () =>
+								{
+									string RemoteOutput = await Proxy.ForwardAsync(Remote!, Method,
+										RemoteParams!, ClientId);
+
+									if (ClientId is not null)
+										ConsoleOut.WriteLine(RemoteOutput);
+								});
+
+								continue;
+							}
+						}
+					}
+
 					InternalJsonRpcCall JsonRpcCall = new(StdioJsonRpcLayer,
 						StdioUser, BaseUrl, SendEvent, "STDIO");
 					if (!string.IsNullOrEmpty(SessionId))
@@ -812,6 +982,17 @@ internal class Program
 						Mcp.RegisterSession(JsonRpcCall, CurrentSession);
 						foreach (HttpMcpServerResource Owner in McpServers)
 							Owner.RegisterSession(JsonRpcCall, CurrentSession);
+					}
+
+					if (Message is not null)
+					{
+						if (!string.IsNullOrEmpty(Output) &&
+							RemoteMcpProxy.IsInitialListRequest(Message, out string ListMethod, out string ArrayName))
+						{
+							Output = await Proxy.AppendRemoteItemsAsync(ListMethod, ArrayName, Output);
+						}
+						else if (Message["method"]?.ToString() == "tools/call")
+							await Proxy.CheckRemotesAvailableAsync();
 					}
 
 					if (!string.IsNullOrEmpty(Output))
